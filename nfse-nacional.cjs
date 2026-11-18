@@ -1,0 +1,646 @@
+'use strict';
+
+/**
+ * NFSe Nacional — Integração direta com portal sefin.nfse.gov.br
+ *
+ * Fluxo: dados → DPS XML → XMLDSig → GZIP → Base64 → mTLS POST
+ * Autenticação: certificado ICP-Brasil A1/A3 em TLS mutual
+ *
+ * Documentação: https://www.nfse.gov.br/swagger/contribuintesissqn/
+ * Namespace DPS: http://www.sped.fazenda.gov.br/nfse (confirmar no XSD oficial)
+ */
+
+const https = require('https');
+const fs    = require('fs');
+const path  = require('path');
+const zlib  = require('zlib');
+const forge = require('node-forge');
+const { SignedXml }    = require('xml-crypto');
+const { gerarDanfsePdf } = require('./danfse.cjs');
+
+// ── Constantes ────────────────────────────────────────────────────────────────
+
+const DATA_DIR = path.join(__dirname, 'data');
+const SEQ_FILE = path.join(DATA_DIR, 'nfse-nacional-seq.json');
+
+// Emissão E consulta são no MESMO host SEFIN (não ADN) — confirmado contra o
+// "Manual dos Contribuintes - Sistema Nacional NFS-e" (gov.br/nfse), seção
+// "1.3 API NFS-e": POST /nfse (emissão), GET /nfse/{chaveAcesso} (consulta),
+// POST /nfse/{chaveAcesso}/eventos (cancelamento). A tentativa original (06/07)
+// de consultar via adn.nfse.gov.br/contribuintes/v1/nfse/{chave} dava 404 —
+// host e path errados, nunca confirmados contra a documentação oficial.
+const SEFIN_PROD_HOST = 'sefin.nfse.gov.br';
+const SEFIN_HOM_HOST  = 'sefin.producaorestrita.nfse.gov.br';
+const SEFIN_PATH      = '/SefinNacional/nfse';
+
+const NS_NFSE = 'http://www.sped.fazenda.gov.br/nfse';
+
+// [cTribNac 6 dígitos LC116, cTribMun 3 dígitos complementar, cNBS 9 dígitos AnexoVIII]
+// Códigos validados contra planilha oficial RJ (nfsenacional.prefeitura.rio/codtribriov2-0/)
+//
+// cTribMun é OBRIGATÓRIO quando o cTribNac se desdobra em vários serviços municipais
+// (ex.: 140101 cobre 047-059 — balanceamento, cartuchos, computadores, eletrodomésticos...).
+// Sem ele o SEFIN não sabe qual subitem aplicar e rejeita com E0312 mesmo com o cTribNac
+// correto — foi o que aconteceu aqui: 140101 e depois 010701 falharam com E0312 até
+// descobrirmos (lendo a planilha oficial) que faltava esse campo, não o código em si.
+//
+// 9511800/9512600 usam 010701 (item 1.07 "Suporte técnico em informática"), não 140101
+// (item 14.01 "Manutenção de computadores") — confirmado em 07/10/2026 contra 3 NFS-e reais
+// (DVC Comércio e Serviços, CNPJ 02.947.559/0001-59, CNAE secundário 9511800 idêntico) de
+// reparo de impressora emitidas e aceitas no RJ, todas sob 01.07.01/001. 140101/051 também
+// é administrado pelo RJ (passou em homologação), mas não é a classificação que prestadores
+// reais desse mesmo CNAE usam na prática.
+const CNAE_PARA_CTN = {
+  // cNBS de 9511800/9512600/6209100 confirmado contra buscadorncm.com.br/nbs/115013000
+  // ("Serviços de suporte em tecnologia da informação"). Os demais cNBS abaixo são os
+  // originais de 06/07, nunca validados contra uma emissão real — só o cTribNac/cTribMun
+  // de cada um foi conferido na planilha oficial do RJ.
+  '5320202': ['150603', '001', '107020000'], // Coleta e entrega de documentos, bens e valores (15.06.03)
+  '5320201': ['150603', '001', '107020000'], // Malote/correspondências → mesmo grupo coleta/entrega (15.06.03)
+  '4930202': ['160201', '004', '105011110'], // Transporte municipal de carga (16.02.04)
+  '9511800': ['010701', '001', '115013000'], // Manutenção de computadores — item 01 TI (01.07.01), precedente DVC
+  '9512600': ['010701', '001', '115013000'], // Manutenção de equipamentos de comunicação — mesmo grupo (01.07.01)
+  '6201500': ['010401', '001', '103091110'], // Elaboração de programa de computadores (01.04.01)
+  '6202300': ['010601', '001', '103091190'], // Assessoria ou consultoria em informática (01.06.01)
+  '6209100': ['010701', '001', '115013000'], // Suporte técnico em informática (01.07.01)
+  '7490100': ['170101', '001', '103999900'], // Assessoria ou consultoria de qualquer natureza (17.01.01)
+  '8020000': ['110201', '001', '101191090'], // Vigilância, segurança ou monitoramento (11.02.03)
+};
+
+// ── T3: certLoader ────────────────────────────────────────────────────────────
+
+function certLoader() {
+  const file = path.join(DATA_DIR, 'techstore-cert.json');
+  if (!fs.existsSync(file)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!raw?.base64 || !raw?.senha) return null;
+    return {
+      pfxBuffer:  Buffer.from(raw.base64, 'base64'),
+      passphrase: raw.senha,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── T7: Numeração sequencial DPS ──────────────────────────────────────────────
+
+function proximoNDps() {
+  let seq = {};
+  try { seq = JSON.parse(fs.readFileSync(SEQ_FILE, 'utf8')); } catch {}
+  const n = (seq.nDPS || 0) + 1;
+  seq.nDPS = n;
+  fs.writeFileSync(SEQ_FILE, JSON.stringify(seq, null, 2), 'utf8');
+  return n;
+}
+
+function rollbackNDps() {
+  try {
+    const seq = JSON.parse(fs.readFileSync(SEQ_FILE, 'utf8'));
+    if (seq.nDPS > 0) { seq.nDPS--; fs.writeFileSync(SEQ_FILE, JSON.stringify(seq, null, 2), 'utf8'); }
+  } catch {}
+}
+
+// ── Utilitários ───────────────────────────────────────────────────────────────
+
+function xmlEsc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function pad(n, len) { return String(n).padStart(len, '0'); }
+
+function agora_br() {
+  const now = new Date();
+  const br  = new Date(now.getTime() - 3 * 3600000);
+  const p = n => pad(n, 2);
+  return `${br.getUTCFullYear()}-${p(br.getUTCMonth()+1)}-${p(br.getUTCDate())}T${p(br.getUTCHours())}:${p(br.getUTCMinutes())}:${p(br.getUTCSeconds())}-03:00`;
+}
+
+function lerCorpoReq(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', c => (raw += c));
+    req.on('end', () => { try { resolve(JSON.parse(raw)); } catch { reject(new Error('JSON inválido no corpo da requisição')); } });
+    req.on('error', reject);
+  });
+}
+
+function respJson(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+// Resposta de emissão/consulta do SEFIN só traz chaveAcesso + nfseXmlGZipB64 —
+// nNFSe (número) e cStat (100=autorizado) vêm de dentro do XML assinado, não
+// como campos soltos no JSON. Extrai os dois sem precisar de parser XML completo.
+function decodificarNfseXml(gzipB64) {
+  if (!gzipB64) return { xml: null, numero: null, cStat: null };
+  const xml    = zlib.gunzipSync(Buffer.from(gzipB64, 'base64')).toString('utf8');
+  const numero = (xml.match(/<nNFSe>(\d+)<\/nNFSe>/) || [])[1] || null;
+  const cStat  = (xml.match(/<cStat>(\d+)<\/cStat>/) || [])[1] || null;
+  return { xml, numero, cStat };
+}
+
+function lerConfigEmpresa() {
+  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'techstore-config.json'), 'utf8') || '{}'); }
+  catch { return {}; }
+}
+
+// ── T4: montarDPS ─────────────────────────────────────────────────────────────
+
+function montarDPS({ dados, configEmpresa, nDPS, tpAmb }) {
+  const { tomador, servico, naturezaOp, infAdicional } = dados;
+
+  const cnpjLimpo = (configEmpresa.cnpj || '').replace(/\D/g, '');
+  if (!cnpjLimpo || cnpjLimpo.length !== 14) throw new Error('CNPJ do emitente inválido ou não configurado.');
+
+  const cMun  = '3304557'; // Código IBGE Rio de Janeiro — fixo para esta empresa
+  const SERIE = '00001';
+
+  const dhEmi    = agora_br();
+  const dCompet  = dhEmi.slice(0, 10);
+
+  // ID DPS = "DPS" + cMun(7) + tpDoc(1) + CNPJ(14) + serie(5) + nDPS(15) = 45 chars
+  // tpDoc: 1=CPF, 2=CNPJ (tpDoc se refere ao emitente)
+  const dpsId = `DPS${cMun}2${cnpjLimpo}${SERIE}${pad(nDPS, 15)}`;
+  if (dpsId.length !== 45) throw new Error(`ID DPS inválido: ${dpsId} (${dpsId.length} chars, esperado 45)`);
+
+  // Tomador
+  const tomDoc = (tomador.doc || '').replace(/\D/g, '');
+  let tomaXml  = '';
+  if (tomDoc.length === 14)      tomaXml += `<CNPJ>${tomDoc}</CNPJ>`;
+  else if (tomDoc.length === 11) tomaXml += `<CPF>${tomDoc}</CPF>`;
+
+  tomaXml += `<xNome>${xmlEsc(tomador.nome)}</xNome>`;
+
+  const cepLimpo = (tomador.cep || '').replace(/\D/g, '');
+  if (cepLimpo.length === 8) {
+    const cMunToma = (tomador.codigoIbge || cMun).replace(/\D/g, '').slice(0, 7);
+    tomaXml += `<end><endNac><cMun>${cMunToma}</cMun><CEP>${cepLimpo}</CEP></endNac>`;
+    if (tomador.logradouro) tomaXml += `<xLgr>${xmlEsc(tomador.logradouro)}</xLgr>`;
+    if (tomador.numero)     tomaXml += `<nro>${xmlEsc(tomador.numero)}</nro>`;
+    if (tomador.bairro)     tomaXml += `<xBairro>${xmlEsc(tomador.bairro)}</xBairro>`;
+    tomaXml += `</end>`;
+  }
+  if (tomador.email) tomaXml += `<email>${xmlEsc(tomador.email)}</email>`;
+  if (tomador.fone)  tomaXml += `<fone>${xmlEsc((tomador.fone || '').replace(/\D/g, ''))}</fone>`;
+
+  // Serviço
+  const cnaeLimpo = (servico.cnae || '').replace(/\D/g, '');
+  const mapaCnae  = CNAE_PARA_CTN[cnaeLimpo];
+  if (!mapaCnae) {
+    // Nunca "chutar" cTribNac/cTribMun/cNBS pra um CNAE não validado: já aconteceu
+    // de um código inventado passar em homologação e sair errado em produção
+    // (ver histórico desta tabela). Bloqueia e pede pra mapear esse CNAE antes.
+    throw new Error(`CNAE ${cnaeLimpo || '(vazio)'} sem código de serviço (cTribNac/cTribMun/cNBS) mapeado em CNAE_PARA_CTN. Pesquise o código correto na planilha oficial (nfsenacional.prefeitura.rio/codtribriov2-0/) antes de emitir.`);
+  }
+  const [cTribNac, cTribMun, cNBS] = mapaCnae;
+  const valorServico = parseFloat(servico.valor || 0).toFixed(2);
+  const pAliq        = parseFloat(servico.aliquotaIss || servico.aliquota || 5).toFixed(2);
+  // Mapeamento invertido: antigo ABRASF issRetido=1(retido) → DPS tpRetISSQN=2; issRetido=2(não retido) → tpRetISSQN=1
+  const issRetidoAnt = parseInt(servico.issRetido ?? '2');
+  const tpRetISSQN   = issRetidoAnt === 1 ? 2 : 1;
+
+  // E0625: SEFIN rejeita <pAliq> quando ISS não é retido pelo tomador (tpRetISSQN=1) pra
+  // prestador Simples Nacional (opSimpNac=3) sem benefício municipal — o ISS dessa empresa
+  // vai embutido na guia do Simples, não é calculado por alíquota na própria nota.
+  // Só informamos pAliq/vIss quando o tomador retém o ISS (tpRetISSQN=2).
+  const vIss = tpRetISSQN === 2 ? (parseFloat(valorServico) * parseFloat(pAliq) / 100).toFixed(2) : '0.00';
+
+  // Regime tributário: opSimpNac=3 (outros optantes SN — LTDA), regApTribSN=1 (SN próprio), regEspTrib=0
+  const xml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<DPS xmlns="${NS_NFSE}" versao="1.00">` +
+      `<infDPS Id="${dpsId}">` +
+        `<tpAmb>${tpAmb}</tpAmb>` +
+        `<dhEmi>${dhEmi}</dhEmi>` +
+        `<verAplic>1.00</verAplic>` +
+        `<serie>${SERIE}</serie>` +
+        `<nDPS>${nDPS}</nDPS>` +
+        `<dCompet>${dCompet}</dCompet>` +
+        `<tpEmit>1</tpEmit>` +
+        `<cLocEmi>${cMun}</cLocEmi>` +
+        `<prest>` +
+          `<CNPJ>${cnpjLimpo}</CNPJ>` +
+          `<regTrib>` +
+            `<opSimpNac>3</opSimpNac>` +
+            `<regApTribSN>1</regApTribSN>` +
+            `<regEspTrib>0</regEspTrib>` +
+          `</regTrib>` +
+        `</prest>` +
+        `<toma>${tomaXml}</toma>` +
+        `<serv>` +
+          `<locPrest>` +
+            `<cLocPrestacao>${cMun}</cLocPrestacao>` +
+          `</locPrest>` +
+          `<cServ>` +
+            `<cTribNac>${cTribNac}</cTribNac>` +
+            `<cTribMun>${cTribMun}</cTribMun>` +
+            `<xDescServ>${xmlEsc(servico.discriminacao)}</xDescServ>` +
+            `<cNBS>${cNBS}</cNBS>` +
+          `</cServ>` +
+        `</serv>` +
+        `<valores>` +
+          `<vServPrest>` +
+            `<vServ>${valorServico}</vServ>` +
+          `</vServPrest>` +
+          `<trib>` +
+            `<tribMun>` +
+              `<tribISSQN>1</tribISSQN>` +
+              `<tpRetISSQN>${tpRetISSQN}</tpRetISSQN>` +
+              (tpRetISSQN === 2 ? `<pAliq>${pAliq}</pAliq>` : '') +
+            `</tribMun>` +
+            `<totTrib>` +
+              `<vTotTrib>` +
+                `<vTotTribFed>0.00</vTotTribFed>` +
+                `<vTotTribEst>0.00</vTotTribEst>` +
+                `<vTotTribMun>${vIss}</vTotTribMun>` +
+              `</vTotTrib>` +
+            `</totTrib>` +
+          `</trib>` +
+        `</valores>` +
+      `</infDPS>` +
+    `</DPS>`;
+
+  return { xml, dpsId };
+}
+
+// ── T5: assinarDPS ────────────────────────────────────────────────────────────
+
+async function assinarDPS(xmlStr, dpsId, pfxBuffer, passphrase) {
+  // Extrair chave privada e certificado do PFX via node-forge
+  const p12Asn1 = forge.asn1.fromDer(
+    forge.util.createBuffer(pfxBuffer.toString('binary'), 'binary')
+  );
+  const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, false, passphrase);
+
+  // Chave privada
+  const keyBags    = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
+  const keyBagList = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag] || [];
+  const keyBag     = keyBagList.find(b => b.key) || keyBagList[0];
+  if (!keyBag?.key) throw new Error('Certificado inválido: chave privada não encontrada no PFX.');
+  const privateKey = forge.pki.privateKeyToPem(keyBag.key);
+
+  // Certificado público
+  const certBags    = p12.getBags({ bagType: forge.pki.oids.certBag });
+  const certBagList = certBags[forge.pki.oids.certBag] || [];
+  const certBag     = certBagList.find(b => b.cert) || certBagList[0];
+  if (!certBag?.cert) throw new Error('Certificado inválido: certificado público não encontrado no PFX.');
+  const publicCert = forge.pki.certificateToPem(certBag.cert);
+
+  const sig = new SignedXml({
+    privateKey,
+    publicCert,
+    signatureAlgorithm:       'http://www.w3.org/2000/09/xmldsig#rsa-sha1',
+    canonicalizationAlgorithm: 'http://www.w3.org/TR/2001/REC-xml-c14n-20010315',
+  });
+
+  sig.addReference({
+    xpath:           `//*[@Id='${dpsId}']`,
+    transforms:      [
+      'http://www.w3.org/2000/09/xmldsig#enveloped-signature',
+      'http://www.w3.org/TR/2001/REC-xml-c14n-20010315',
+    ],
+    digestAlgorithm: 'http://www.w3.org/2000/09/xmldsig#sha1',
+    uri:             `#${dpsId}`,
+    isEmptyUri:      false,
+  });
+
+  await sig.computeSignature(xmlStr, {
+    prefix:   '',
+    location: {
+      reference: `//*[local-name()='DPS']`,
+      action:    'append',
+    },
+  });
+
+  return sig.getSignedXml();
+}
+
+// ── T6: Compressão e envio mTLS ───────────────────────────────────────────────
+
+function gzipBase64(xmlStr) {
+  return new Promise((resolve, reject) => {
+    zlib.gzip(Buffer.from(xmlStr, 'utf8'), (err, buf) => {
+      if (err) reject(err);
+      else resolve(buf.toString('base64'));
+    });
+  });
+}
+
+function mtlsRequest({ host, reqPath, method, bodyObj, pfxBuffer, passphrase }) {
+  return new Promise((resolve, reject) => {
+    const bodyStr    = bodyObj ? JSON.stringify(bodyObj) : '';
+    const bodyBuffer = bodyStr ? Buffer.from(bodyStr, 'utf8') : null;
+    const opts = {
+      hostname: host,
+      port:     443,
+      path:     reqPath,
+      method:   method || 'GET',
+      headers:  {
+        'Content-Type':  'application/json; charset=utf-8',
+        'Accept':        'application/json',
+      },
+      pfx:                 pfxBuffer,
+      passphrase:          passphrase,
+      rejectUnauthorized:  false, // ambientes gov.br usam certs que podem falhar validação padrão
+      timeout:             30000,
+    };
+    if (bodyBuffer) opts.headers['Content-Length'] = bodyBuffer.length;
+
+    const req = https.request(opts, res => {
+      let data = '';
+      res.on('data', c => (data += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, body: data }); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout na conexão com portal NFSe Nacional.')); });
+    if (bodyBuffer) req.write(bodyBuffer);
+    req.end();
+  });
+}
+
+// ── T8: handleEmitir ─────────────────────────────────────────────────────────
+
+async function handleEmitir(req, res) {
+  try {
+    const corpo = await lerCorpoReq(req);
+    const { dados, config } = corpo;
+
+    if (!dados) return respJson(res, 400, { ok: false, erro: 'Campo "dados" ausente na requisição.' });
+
+    const cert = certLoader();
+    if (!cert) return respJson(res, 400, { ok: false, erro: 'Certificado digital não configurado. Acesse Configurações > Certificado e carregue um arquivo .pfx.' });
+
+    const ambiente  = (config?.ambiente || '').toLowerCase().includes('produ') ? 'producao' : 'homologacao';
+    const tpAmb     = ambiente === 'producao' ? 1 : 2;
+    const sefinHost = ambiente === 'producao' ? SEFIN_PROD_HOST : SEFIN_HOM_HOST;
+
+    const cfgEmpresa = lerConfigEmpresa();
+    const configEmpresa = {
+      cnpj: (cfgEmpresa['cfg-cnpj'] || config?.cnpj || '').replace(/\D/g, ''),
+    };
+
+    if (!configEmpresa.cnpj || configEmpresa.cnpj.length !== 14) {
+      return respJson(res, 400, { ok: false, erro: 'CNPJ da empresa não configurado. Acesse Configurações e preencha o CNPJ.' });
+    }
+
+    const nDPS = proximoNDps();
+    console.log(`[NFSe Nacional] Emitindo DPS nº ${nDPS} em ${ambiente}...`);
+
+    let xmlAssinado, dpsId;
+    try {
+      const { xml, dpsId: id } = montarDPS({ dados, configEmpresa, nDPS, tpAmb });
+      dpsId = id;
+      console.log(`[NFSe Nacional] DPS montado: ${dpsId}`);
+      xmlAssinado = await assinarDPS(xml, dpsId, cert.pfxBuffer, cert.passphrase);
+      console.log(`[NFSe Nacional] DPS assinado com sucesso.`);
+    } catch (err) {
+      rollbackNDps();
+      return respJson(res, 400, { ok: false, erro: `Erro ao gerar DPS: ${err.message}` });
+    }
+
+    const dpsXmlGZipB64 = await gzipBase64(xmlAssinado);
+
+    const { status, body } = await mtlsRequest({
+      host:       sefinHost,
+      reqPath:    SEFIN_PATH,
+      method:     'POST',
+      bodyObj:    { dpsXmlGZipB64 },
+      pfxBuffer:  cert.pfxBuffer,
+      passphrase: cert.passphrase,
+    });
+
+    console.log(`[NFSe Nacional] Resposta HTTP ${status}:`, JSON.stringify(body).slice(0, 400));
+
+    if (status === 200 || status === 201) {
+      let numero = null;
+      try { ({ numero } = decodificarNfseXml(body.nfseXmlGZipB64)); } catch (e) { console.error('[NFSe Nacional] falha ao decodificar XML da resposta:', e.message); }
+      return respJson(res, 200, {
+        ok:          true,
+        chaveAcesso: body.chaveAcesso || body.chNFSe   || body.chave  || null,
+        numero:      numero           || body.nNFSe     || body.numero || null,
+        status:      body.status      || 'autorizado',
+        ambiente,
+        nDPS,
+        dpsId,
+        detalhe:     body,
+      });
+    }
+
+    // Emissão falhou — desfaz o contador para permitir reenvio
+    rollbackNDps();
+    const erroMsg = extrairErro(body);
+    return respJson(res, 422, {
+      ok:      false,
+      erro:    `Portal NFSe Nacional retornou ${status}: ${erroMsg}`,
+      detalhe: body,
+    });
+
+  } catch (err) {
+    console.error('[NFSe Nacional handleEmitir]', err.message);
+    return respJson(res, 500, { ok: false, erro: err.message });
+  }
+}
+
+// Consulta compartilhada por handleConsultar, handleBaixarXml e handleBaixarPdf
+// — mesmo host/path (SEFIN, não ADN — ver comentário nas constantes acima).
+async function consultarSefin(chaveAcesso, ambiente) {
+  const cert = certLoader();
+  if (!cert) return { erro: 'Certificado digital não configurado.' };
+
+  const sefinHost = ambiente === 'producao' ? SEFIN_PROD_HOST : SEFIN_HOM_HOST;
+  const { status, body } = await mtlsRequest({
+    host:       sefinHost,
+    reqPath:    `${SEFIN_PATH}/${encodeURIComponent(chaveAcesso)}`,
+    method:     'GET',
+    pfxBuffer:  cert.pfxBuffer,
+    passphrase: cert.passphrase,
+  });
+  return { status, body };
+}
+
+// ── T9: handleConsultar ──────────────────────────────────────────────────────
+
+async function handleConsultar(req, res, parsed) {
+  try {
+    const qs           = new URLSearchParams(parsed?.query || '');
+    const chaveAcesso  = qs.get('chaveAcesso');
+    const ambiente     = (qs.get('ambiente') || 'homologacao').toLowerCase().includes('produ') ? 'producao' : 'homologacao';
+
+    if (!chaveAcesso) return respJson(res, 400, { ok: false, erro: 'Parâmetro "chaveAcesso" obrigatório.' });
+
+    console.log(`[NFSe Nacional consultar] ${chaveAcesso.slice(0, 12)}... em ${ambiente}`);
+
+    const { status, body, erro } = await consultarSefin(chaveAcesso, ambiente);
+    if (erro) return respJson(res, 400, { ok: false, erro });
+
+    console.log(`[NFSe Nacional consultar] HTTP ${status}`);
+
+    if (status === 200) {
+      let numero = null, cStat = null;
+      try { ({ numero, cStat } = decodificarNfseXml(body.nfseXmlGZipB64)); } catch (e) { console.error('[NFSe Nacional consultar] falha ao decodificar XML:', e.message); }
+      return respJson(res, 200, {
+        ok:          true,
+        chaveAcesso,
+        numero,
+        // cStat 100 = autorizada. Eventos (cancelamento etc.) não aparecem aqui —
+        // GET /nfse/{chave}/eventos consultaria isso separadamente se precisarmos.
+        status:      cStat === '100' ? 'autorizado' : 'processando',
+        detalhe:     body,
+      });
+    }
+
+    return respJson(res, status === 404 ? 404 : 502, {
+      ok:      false,
+      erro:    status === 404 ? 'NFS-e não encontrada.' : `Consulta retornou ${status}: ${extrairErro(body)}`,
+      detalhe: body,
+    });
+
+  } catch (err) {
+    console.error('[NFSe Nacional handleConsultar]', err.message);
+    return respJson(res, 500, { ok: false, erro: err.message });
+  }
+}
+
+// ── T10: handleCancelar ──────────────────────────────────────────────────────
+
+async function handleCancelar(req, res) {
+  try {
+    const { chaveAcesso, justificativa, config } = await lerCorpoReq(req);
+
+    if (!chaveAcesso) return respJson(res, 400, { ok: false, erro: 'Campo "chaveAcesso" obrigatório.' });
+    if (!justificativa || justificativa.trim().length < 15) {
+      return respJson(res, 400, { ok: false, erro: 'Justificativa deve ter pelo menos 15 caracteres.' });
+    }
+
+    const cert = certLoader();
+    if (!cert) return respJson(res, 400, { ok: false, erro: 'Certificado digital não configurado.' });
+
+    const ambiente  = (config?.ambiente || '').toLowerCase().includes('produ') ? 'producao' : 'homologacao';
+    const sefinHost = ambiente === 'producao' ? SEFIN_PROD_HOST : SEFIN_HOM_HOST;
+    const reqPath   = `${SEFIN_PATH}/${encodeURIComponent(chaveAcesso)}/eventos`;
+
+    console.log(`[NFSe Nacional cancelar] ${chaveAcesso.slice(0, 12)}... em ${ambiente}`);
+
+    const { status, body } = await mtlsRequest({
+      host:       sefinHost,
+      reqPath,
+      method:     'POST',
+      bodyObj:    { tpEvento: '1', xJust: justificativa.trim() },
+      pfxBuffer:  cert.pfxBuffer,
+      passphrase: cert.passphrase,
+    });
+
+    console.log(`[NFSe Nacional cancelar] HTTP ${status}:`, JSON.stringify(body).slice(0, 200));
+
+    if (status === 200 || status === 201) {
+      return respJson(res, 200, { ok: true, status: 'cancelado', detalhe: body });
+    }
+
+    return respJson(res, 502, {
+      ok:      false,
+      erro:    `Cancelamento retornou ${status}: ${extrairErro(body)}`,
+      detalhe: body,
+    });
+
+  } catch (err) {
+    console.error('[NFSe Nacional handleCancelar]', err.message);
+    return respJson(res, 500, { ok: false, erro: err.message });
+  }
+}
+
+// ── handleBaixarXml: GET /nfse/xml?chaveAcesso=...&ambiente=... ────────────────
+// SEFIN não tem endpoint de DANFSe (PDF) nem hospeda arquivo — só devolve o XML
+// assinado via consulta. Decodifica na hora e manda como download, sem guardar
+// cópia em disco (consulta é rápida e sempre reflete o estado atual no gov).
+
+async function handleBaixarXml(req, res, parsed) {
+  try {
+    const qs          = new URLSearchParams(parsed?.query || '');
+    const chaveAcesso = qs.get('chaveAcesso');
+    const ambiente    = (qs.get('ambiente') || 'homologacao').toLowerCase().includes('produ') ? 'producao' : 'homologacao';
+
+    if (!chaveAcesso) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Parâmetro "chaveAcesso" obrigatório.'); }
+
+    const { status, body, erro } = await consultarSefin(chaveAcesso, ambiente);
+    if (erro) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(erro); }
+
+    if (status !== 200 || !body?.nfseXmlGZipB64) {
+      res.writeHead(status === 404 ? 404 : 502, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(status === 404 ? 'NFS-e não encontrada.' : `Consulta retornou ${status}: ${extrairErro(body)}`);
+    }
+
+    const xml = zlib.gunzipSync(Buffer.from(body.nfseXmlGZipB64, 'base64'));
+    res.writeHead(200, {
+      'Content-Type':        'application/xml; charset=utf-8',
+      'Content-Disposition': `attachment; filename="NFSe_${chaveAcesso}.xml"`,
+      'Content-Length':      xml.length,
+    });
+    res.end(xml);
+
+  } catch (err) {
+    console.error('[NFSe Nacional handleBaixarXml]', err.message);
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Erro ao baixar XML: ' + err.message);
+  }
+}
+
+// ── handleBaixarPdf: GET /nfse/pdf?chaveAcesso=...&ambiente=... ────────────────
+// DANFSe próprio — gov não expõe endpoint de PDF. Ver danfse.cjs.
+
+async function handleBaixarPdf(req, res, parsed) {
+  try {
+    const qs          = new URLSearchParams(parsed?.query || '');
+    const chaveAcesso = qs.get('chaveAcesso');
+    const ambiente    = (qs.get('ambiente') || 'homologacao').toLowerCase().includes('produ') ? 'producao' : 'homologacao';
+
+    if (!chaveAcesso) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Parâmetro "chaveAcesso" obrigatório.'); }
+
+    const { status, body, erro } = await consultarSefin(chaveAcesso, ambiente);
+    if (erro) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(erro); }
+
+    if (status !== 200 || !body?.nfseXmlGZipB64) {
+      res.writeHead(status === 404 ? 404 : 502, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(status === 404 ? 'NFS-e não encontrada.' : `Consulta retornou ${status}: ${extrairErro(body)}`);
+    }
+
+    const xml = zlib.gunzipSync(Buffer.from(body.nfseXmlGZipB64, 'base64')).toString('utf8');
+    const pdf = await gerarDanfsePdf({ xml, chaveAcesso, ambiente });
+
+    res.writeHead(200, {
+      'Content-Type':        'application/pdf',
+      'Content-Disposition': `inline; filename="DANFSe_${chaveAcesso}.pdf"`,
+      'Content-Length':      pdf.length,
+    });
+    res.end(pdf);
+
+  } catch (err) {
+    console.error('[NFSe Nacional handleBaixarPdf]', err.message);
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Erro ao gerar DANFSe: ' + err.message);
+  }
+}
+
+// ── Helpers internos ─────────────────────────────────────────────────────────
+
+function extrairErro(body) {
+  if (typeof body === 'string') return body.slice(0, 300);
+  // Formato portal NFSe Nacional: { erros: [{ Codigo, Descricao, Complemento }] }
+  if (Array.isArray(body?.erros) && body.erros.length > 0) {
+    const e = body.erros[0];
+    return `[${e.Codigo}] ${e.Descricao}${e.Complemento ? ' — ' + e.Complemento.slice(0, 200) : ''}`;
+  }
+  return body?.mensagem || body?.descricao || body?.message || body?.error || JSON.stringify(body).slice(0, 300);
+}
+
+// ── Exports ──────────────────────────────────────────────────────────────────
+
+module.exports = {
+  handleEmitir, handleConsultar, handleCancelar, handleBaixarXml, handleBaixarPdf,
+  montarDPS, CNAE_PARA_CTN, // exportados só pra teste (test #3 do gate de risco)
+};

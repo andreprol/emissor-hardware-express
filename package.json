@@ -1,0 +1,22 @@
+{
+  "name": "emissor-hardware-express",
+  "version": "1.0.0",
+  "description": "Emissor de NF-e/NFS-e da Hardware Express Online — clone do nfe-issuer da RJ Logística, com autenticação server-side própria.",
+  "main": "emissor-server.cjs",
+  "scripts": {
+    "test": "jest --testEnvironment node"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "node-forge": "^1.4.0",
+    "pdfkit": "^0.20.2",
+    "qrcode": "^1.5.4",
+    "xml-crypto": "^6.1.2"
+  }
+}
