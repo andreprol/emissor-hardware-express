@@ -1,6 +1,6 @@
 /**
  * SEFAZ Server — Emissor de Notas (Hardware Express Online)
- * Porta: 3002
+ * Porta: 3012
  * Implementa: NF-e DistDFe (consulta NF-e recebidas) + NF-e Autorização (emissão)
  * Protocolo: SOAP 1.2 + XML-DSig (RSA-SHA256 + C14N)
  */
@@ -11,7 +11,7 @@ const https = require('https');
 const forge = require('node-forge');
 const crypto = require('crypto');
 
-const PORTA = 3002;
+const PORTA = 3012;
 
 // ── Endpoints SEFAZ por ambiente ──────────────────────────────────────────────
 const ENDPOINTS = {

@@ -1,6 +1,6 @@
 /**
  * Servidor de E-mail Local — TechStore
- * Porta: 3001
+ * Porta: 3011
  * Conta padrão: andreprol1980@gmail.com (Gmail)
  */
 
@@ -33,7 +33,7 @@ try {
   nodemailer = require(path.join(globalModules, 'nodemailer'));
 }
 
-const PORTA = 3001;
+const PORTA = 3011;
 
 // Armazena config em AppData — persiste entre reinstalações do projeto
 const APP_DATA_DIR = path.join(

@@ -2,7 +2,7 @@
  * Emissor de Notas — Servidor Principal
  * Porta: 3003
  * - Serve o index.html e arquivos estáticos
- * - Proxy reverso para email-server (3001) e sefaz-server (3002)
+ * - Proxy reverso para email-server (3011) e sefaz-server (3012)
  * - Exposto publicamente via Cloudflare Tunnel — por isso toda rota que
  *   toca dado de verdade exige sessão (ver bloco "Autenticação" abaixo)
  */
@@ -251,7 +251,7 @@ async function handleFocusCancelar(req, res) {
   }
 }
 
-const PORTA = Number(process.env.PORTA) || 3003;
+const PORTA = Number(process.env.PORTA) || 3013;
 const DIR   = __dirname;
 
 // ── Armazenamento de dados no servidor ───────────────────────────────────────
@@ -521,7 +521,7 @@ function proxyRequest(req, res, targetPort, targetPath) {
   });
 
   proxyReq.on('error', err => {
-    const servico = targetPort === 3001 ? 'Email Server' : 'SEFAZ Server';
+    const servico = targetPort === 3011 ? 'Email Server' : 'SEFAZ Server';
     res.writeHead(503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: false,
@@ -576,16 +576,16 @@ const server = http.createServer((req, res) => {
     (pathname.startsWith('/focus/') && pathname !== '/focus/ping');
   if (rotaProtegida && !requireAuth(req)) return negarAcesso(res);
 
-  // ── Proxy: /email/* → porta 3001 ──
+  // ── Proxy: /email/* → porta 3011 ──
   if (pathname.startsWith('/email/')) {
     const target = pathname.replace('/email', '');
-    return proxyRequest(req, res, 3001, target + (parsed.search || ''));
+    return proxyRequest(req, res, 3011, target + (parsed.search || ''));
   }
 
-  // ── Proxy: /sefaz/* → porta 3002 ──
+  // ── Proxy: /sefaz/* → porta 3012 ──
   if (pathname.startsWith('/sefaz/')) {
     const target = pathname.replace('/sefaz', '');
-    return proxyRequest(req, res, 3002, target + (parsed.search || ''));
+    return proxyRequest(req, res, 3012, target + (parsed.search || ''));
   }
 
   // ── API de dados: GET /api/data/:key ──
@@ -755,8 +755,8 @@ server.listen(PORTA, '0.0.0.0', () => {
   console.log(`  Rede:    http://0.0.0.0:${PORTA}`);
   console.log('');
   console.log('  Rotas proxy:');
-  console.log('    /email/*  → porta 3001 (Email Server)');
-  console.log('    /sefaz/*  → porta 3002 (SEFAZ Server)');
+  console.log('    /email/*  → porta 3011 (Email Server)');
+  console.log('    /sefaz/*  → porta 3012 (SEFAZ Server)');
   console.log('');
   console.log('Pressione Ctrl+C para encerrar.');
 });
