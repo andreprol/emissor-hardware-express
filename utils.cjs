@@ -31,7 +31,7 @@ function mesAnoLocal(isoStr) {
 }
 
 function montarPayloadFocus(dados, config) {
-  const { nNF, naturezaOp, tpNF, cliente, itens, pagamento, infAdicional } = dados;
+  const { nNF, serie, naturezaOp, tpNF, cliente, itens, pagamento, infAdicional } = dados;
   const cnpjLimpo    = (config.cnpj || '').replace(/\D/g, '');
   const destDocLimpo = (cliente.doc || '').replace(/\D/g, '');
   const _now = new Date();
@@ -43,6 +43,8 @@ function montarPayloadFocus(dados, config) {
   const payload = {
     cnpj_emitente: cnpjLimpo,
     ref,
+    numero: nNF,
+    serie:  serie || '1',
     natureza_operacao:  naturezaOp || 'Venda de Mercadoria',
     data_emissao:       agora,
     tipo_documento:     parseInt(tpNF || '1'),

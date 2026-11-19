@@ -1569,6 +1569,11 @@
           <div class="form-grupo"><label>Inscrição Estadual</label><input type="text" id="cfg-ie" value="000.000.00-0"></div>
           <div class="form-grupo"><label>Inscrição Municipal ISS <small style="color:#888">(obrigatório para NFS-e Nota Carioca)</small></label><input type="text" id="cfg-inscricao-municipal" placeholder="Ex: 1234567"></div>
           <div class="form-grupo"><label>Regime Tributário</label><select id="cfg-regime"><option>Simples Nacional</option><option>Lucro Presumido</option><option>Lucro Real</option></select></div>
+          <div class="form-grupo"><label>Logradouro <small style="color:#888">(obrigatório para emissão direta via SEFAZ)</small></label><input type="text" id="cfg-logradouro" placeholder="Ex: R. Visconde de Pirajá"></div>
+          <div class="form-grupo"><label>Número</label><input type="text" id="cfg-numero" placeholder="Ex: 414"></div>
+          <div class="form-grupo"><label>Complemento</label><input type="text" id="cfg-complemento" placeholder="Ex: sl 718"></div>
+          <div class="form-grupo"><label>Bairro</label><input type="text" id="cfg-bairro" placeholder="Ex: Ipanema"></div>
+          <div class="form-grupo"><label>CEP</label><input type="text" id="cfg-cep" placeholder="Ex: 22410-002"></div>
           <div class="form-grupo">
             <label>E-mails da Empresa</label>
             <div class="email-tags-container" id="tags-empresa"><span class="email-tags-vazio">Nenhum e-mail adicionado</span></div>
@@ -2880,7 +2885,7 @@
         // ── Via Focus NFe (API REST intermediária) ──
         resp  = await fetch('/focus/nfe/emitir', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
           body: JSON.stringify({ token: focusToken, dados: dadosComuns, config: configComum }),
           signal: AbortSignal.timeout(60000),
         });
@@ -2890,7 +2895,7 @@
         const certData = _getCertParaSefaz();
         resp  = await fetch('/sefaz/nfe/emitir', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
           body: JSON.stringify({
             certBase64: certData.base64,
             certSenha:  certData.senha,
@@ -3522,6 +3527,7 @@
 
   const CFG_CAMPOS = [
     'cfg-razao-social','cfg-cnpj','cfg-ie','cfg-regime','cfg-inscricao-municipal',
+    'cfg-logradouro','cfg-numero','cfg-complemento','cfg-bairro','cfg-cep',
     'cfg-nome','cfg-email','cfg-perfil',
     'cfg-nfe-serie-hom','cfg-nfe-proximo-hom','cfg-nfe-serie-prod','cfg-nfe-proximo-prod',
     'cfg-focus-token-hom','cfg-focus-token-prod',
@@ -3639,7 +3645,7 @@
 
   // Verifica App Password salva no servidor ao carregar
   const _verificarSenhaServidor = () => {
-    fetch('/email/get-config').then(r => r.json()).then(d => {
+    fetch('/email/get-config', { headers: { 'Authorization': 'Bearer ' + _getToken() } }).then(r => r.json()).then(d => {
       const statusEl = document.getElementById('smtp-status');
       if (!statusEl) return;
       if (d.configurado) {
@@ -3672,7 +3678,7 @@
     if (senha) {
       fetch('/email/set-password', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
         body: JSON.stringify({ senha })
       }).then(r => r.json()).then(d => {
         if (d.ok) {
@@ -3724,7 +3730,7 @@
       if (senha) {
         await fetch('/email/set-password', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
           body: JSON.stringify({ senha })
         });
         const campoSenha = document.getElementById('cfg-smtp-senha');
@@ -3734,7 +3740,7 @@
 
       const resp = await fetch('/email/send-email', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
         body: JSON.stringify({
           remetentesEmpresa,
           destinatarios,
@@ -3840,7 +3846,7 @@
     try {
       const resp = await fetch('/sefaz/nfe/consultar-recebidas', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
         body: JSON.stringify({
           certBase64: certData.base64,
           certSenha:  certData.senha,
@@ -3977,7 +3983,9 @@
     }
     try {
       mostrarToast('⏳', 'Baixando arquivo...');
-      const resp = await fetch(`/focus/download?url=${encodeURIComponent(urlFocus)}&token=${encodeURIComponent(token)}`);
+      const resp = await fetch(`/focus/download?url=${encodeURIComponent(urlFocus)}&token=${encodeURIComponent(token)}`, {
+        headers: { 'Authorization': 'Bearer ' + _getToken() },
+      });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const blob = await resp.blob();
       const a = document.createElement('a');
@@ -4228,7 +4236,7 @@ async function gerarConvite() {
     if (cfg['cfg-smtp-host']||cfg['cfg-smtp-nome']) {
       const resp = await fetch('/email/send-email', {
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers:{'Content-Type':'application/json', 'Authorization': 'Bearer ' + _getToken()},
         body: JSON.stringify({
           smtp: { host: cfg['cfg-smtp-host']||'smtp.gmail.com', porta: cfg['cfg-smtp-porta']||587, usuario: cfg['cfg-smtp-usuario']||'', senha: cfg['cfg-smtp-senha']||'', nomeRemetente: cfg['cfg-smtp-nome']||'Sistema' },
           remetentesEmpresa: cfg['emails-empresa']||[],
@@ -4482,7 +4490,7 @@ async function emitirNfse() {
   try {
     const resp = await fetch('/nfse/emitir', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
       body: JSON.stringify({ dados, config: ambConfig }),
     });
     const rawText = await resp.text();
@@ -4534,7 +4542,9 @@ async function nfsePollarPendentes() {
     for (const nota of pending) {
       try {
         const ambParam = encodeURIComponent(nota.ambiente === 'producao' ? 'producao' : 'homologacao');
-        const resp = await fetch(`/nfse/consultar?chaveAcesso=${encodeURIComponent(nota.chaveAcesso)}&ambiente=${ambParam}`);
+        const resp = await fetch(`/nfse/consultar?chaveAcesso=${encodeURIComponent(nota.chaveAcesso)}&ambiente=${ambParam}`, {
+          headers: { 'Authorization': 'Bearer ' + _getToken() },
+        });
         if (!resp.ok) continue;
         const data = await resp.json();
         if (!data || !data.status) continue;
@@ -4582,7 +4592,7 @@ async function cancelarNfse(chaveAcesso, ambiente) {
   try {
     const resp = await fetch('/nfse/cancelar', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
       body: JSON.stringify({ chaveAcesso, justificativa: justificativa.trim(), config: { ambiente: ambiente === 'producao' ? 'Produção' : 'Homologação' } }),
     });
     const data = await resp.json();
@@ -4693,7 +4703,9 @@ async function backfillNumerosNfse() {
   for (const nota of semNumero) {
     try {
       const ambParam = encodeURIComponent(nota.ambiente === 'producao' ? 'producao' : 'homologacao');
-      const resp = await fetch(`/nfse/consultar?chaveAcesso=${encodeURIComponent(nota.chaveAcesso)}&ambiente=${ambParam}`);
+      const resp = await fetch(`/nfse/consultar?chaveAcesso=${encodeURIComponent(nota.chaveAcesso)}&ambiente=${ambParam}`, {
+        headers: { 'Authorization': 'Bearer ' + _getToken() },
+      });
       if (!resp.ok) continue;
       const data = await resp.json();
       if (data?.ok && data.numero) { nota.numero = data.numero; atualizado = true; }
@@ -5116,7 +5128,9 @@ async function _baixarArquivoFocus(urlFocus, nomeArquivo, ambienteNota) {
   const cfgFull = _getConfig();
   const isProd  = (ambienteNota || '').toLowerCase().includes('prod');
   const token   = isProd ? cfgFull.tokenProducao : cfgFull.tokenHomologacao;
-  const resp  = await fetch(`/focus/download?url=${encodeURIComponent(urlFocus)}&token=${encodeURIComponent(token)}`);
+  const resp  = await fetch(`/focus/download?url=${encodeURIComponent(urlFocus)}&token=${encodeURIComponent(token)}`, {
+    headers: { 'Authorization': 'Bearer ' + _getToken() },
+  });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return await resp.blob();
 }
@@ -5192,7 +5206,10 @@ function _getCertParaSefaz() {
 
 async function _verificarSefazServer() {
   try {
-    const r = await fetch('/sefaz/ping', { signal: AbortSignal.timeout(3000) });
+    const r = await fetch('/sefaz/ping', {
+      signal: AbortSignal.timeout(3000),
+      headers: { 'Authorization': 'Bearer ' + _getToken() },
+    });
     const j = await r.json();
     return j.ok === true;
   } catch { return false; }
@@ -5364,7 +5381,7 @@ async function cancelarNFe(idx) {
     mostrarToast('⏳', 'Solicitando cancelamento...');
     const resp = await fetch('/focus/nfe/cancelar', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _getToken() },
       body: JSON.stringify({ token, ref: nota.focusRef, justificativa: justificativa.trim(), config: configCancel }),
     });
     const dados = await resp.json();

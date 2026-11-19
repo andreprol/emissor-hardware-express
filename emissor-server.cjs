@@ -124,7 +124,7 @@ async function handleFocusNfseEmitir(req, res) {
       try {
         erros = (envio.body?.erros || []).map(e => e.mensagem).join('; ') || String(envio.body);
       } catch(_) { erros = String(envio.body); }
-      res.writeHead(502, {'Content-Type':'application/json'});
+      res.writeHead(200, {'Content-Type':'application/json'});
       res.end(JSON.stringify({ ok:false, erro:`Focus NFe rejeitou (${envio.status}): ${erros}`, detalhe: String(envio.body) }));
       return;
     }
@@ -162,7 +162,7 @@ async function handleFocusNfseCancelar(req, res) {
       res.end(JSON.stringify({ ok: true, status: result.body?.status, msg: 'Cancelamento solicitado com sucesso.', detalhe: result.body }));
     } else {
       const erros = result.body?.erros?.map(e => e.mensagem).join('; ') || JSON.stringify(result.body);
-      res.writeHead(502, {'Content-Type':'application/json'});
+      res.writeHead(200, {'Content-Type':'application/json'});
       res.end(JSON.stringify({ ok: false, erro: `Focus NFe: ${erros}`, detalhe: result.body }));
     }
   } catch (err) {
@@ -198,7 +198,7 @@ async function handleFocusEmitir(req, res) {
     const envio = await focusRequest({ host, path: `/v2/nfe?ref=${ref}`, method: 'POST', token, body: payload });
     if (![200, 201, 202].includes(envio.status)) {
       const erros = envio.body?.erros?.map(e => e.mensagem).join('; ') || JSON.stringify(envio.body);
-      res.writeHead(502, {'Content-Type':'application/json'});
+      res.writeHead(200, {'Content-Type':'application/json'});
       res.end(JSON.stringify({ ok:false, erro:`Focus NFe rejeitou: ${erros}`, detalhe: envio.body }));
       return;
     }
@@ -242,7 +242,7 @@ async function handleFocusCancelar(req, res) {
       res.end(JSON.stringify({ ok: true, status: result.body?.status, msg: 'Cancelamento solicitado com sucesso.', detalhe: result.body }));
     } else {
       const erros = result.body?.erros?.map(e => e.mensagem).join('; ') || JSON.stringify(result.body);
-      res.writeHead(502, {'Content-Type':'application/json'});
+      res.writeHead(200, {'Content-Type':'application/json'});
       res.end(JSON.stringify({ ok: false, erro: `Focus NFe: ${erros}`, detalhe: result.body }));
     }
   } catch (err) {

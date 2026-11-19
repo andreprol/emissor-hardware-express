@@ -335,7 +335,7 @@ function montarNFeXml(dados, config) {
   } = config;
 
   const cnpjLimpo = (cnpj || '').replace(/\D/g,'');
-  const tpAmb     = ambiente === 'producao' ? '1' : '2';
+  const tpAmb     = ambiente === 'Homologação (teste)' ? '2' : '1';
   const cUF       = UF_CODIGO[uf] || 33;
   const mod       = '55';
   const tpEmis    = '1';
@@ -396,7 +396,7 @@ function montarNFeXml(dados, config) {
   const tPag = { 'dinheiro':'01', 'pix':'17', 'debito':'04', 'credito':'03', 'boleto':'15', 'transferencia':'03' };
   const codPag = tPag[(pagamento||'').toLowerCase().split(' ')[0]] || '01';
 
-  const infNFe = `<infNFe versao="4.00" Id="NFe${chave}" xmlns="http://www.portalfiscal.inf.br/nfe">` +
+  const infNFe = `<infNFe versao="4.00" Id="NFe${chave}">` +
     `<ide>` +
       `<cUF>${cUF}</cUF>` +
       `<cNF>${cNF}</cNF>` +
@@ -486,19 +486,20 @@ function montarNFeXml(dados, config) {
 
 function buildNFeEnvelope(nfeXmlAssinado, nNF, serie, tpAmb) {
   const idLote = String(Date.now()).slice(-15);
+  // A declaração <?xml ...?> só é válida no início de um documento — tem que
+  // sair daqui, já que o NFe assinado vira um elemento filho dentro do SOAP.
+  const nfeSemDeclaracao = nfeXmlAssinado.replace(/^\s*<\?xml[^?]*\?>\s*/, '');
   return `<?xml version="1.0" encoding="UTF-8"?>` +
   `<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">` +
     `<soap12:Header/>` +
     `<soap12:Body>` +
-      `<nfeAutorizacaoLote xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4">` +
-        `<nfeDadosMsg>` +
-          `<enviNFe versao="4.00" xmlns="http://www.portalfiscal.inf.br/nfe">` +
-            `<idLote>${idLote}</idLote>` +
-            `<indSinc>1</indSinc>` +
-            `${nfeXmlAssinado}` +
-          `</enviNFe>` +
-        `</nfeDadosMsg>` +
-      `</nfeAutorizacaoLote>` +
+      `<nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeAutorizacao4">` +
+        `<enviNFe versao="4.00" xmlns="http://www.portalfiscal.inf.br/nfe">` +
+          `<idLote>${idLote}</idLote>` +
+          `<indSinc>1</indSinc>` +
+          `${nfeSemDeclaracao}` +
+        `</enviNFe>` +
+      `</nfeDadosMsg>` +
     `</soap12:Body>` +
   `</soap12:Envelope>`;
 }
@@ -555,7 +556,7 @@ const server = http.createServer(async (req, res) => {
       });
 
       if (status !== 200) {
-        headers(res, 502);
+        headers(res, 200);
         res.end(JSON.stringify({ ok: false, erro: `SEFAZ retornou HTTP ${status}`, xmlResp }));
         return;
       }
@@ -602,7 +603,7 @@ const server = http.createServer(async (req, res) => {
       });
 
       if (status !== 200) {
-        headers(res, 502);
+        headers(res, 200);
         res.end(JSON.stringify({ ok: false, erro: `SEFAZ retornou HTTP ${status}`, xmlResp }));
         return;
       }
