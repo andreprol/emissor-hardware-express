@@ -69,17 +69,55 @@ const CNAE_PARA_CTN = {
 
 // ── T3: certLoader ────────────────────────────────────────────────────────────
 
+// Extrai chave privada + certificado em PEM a partir do .pfx via node-forge.
+// node-forge faz sua própria crypto (não depende do OpenSSL do SO), então lê
+// PFX legados (RC2-40/3DES, comum em e-CNPJ ICP-Brasil) que o OpenSSL 3.x do
+// Node (Node 18+) recusa com "Unsupported PKCS12 PFX data" quando a chave é
+// passada direto via `pfx:` no https.request — por isso NUNCA repassar o
+// Buffer do .pfx pro TLS nativo do Node; sempre extrair cert/key em PEM aqui
+// e usar `cert:`/`key:` no https.request (mesmo padrão do sefaz-server.cjs).
+function extrairChaveECertPem(pfxBuffer, passphrase) {
+  const p12Asn1 = forge.asn1.fromDer(
+    forge.util.createBuffer(pfxBuffer.toString('binary'), 'binary')
+  );
+  const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, false, passphrase);
+
+  const keyBags    = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
+  const keyBagList = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag] || [];
+  const keyBag     = keyBagList.find(b => b.key) || keyBagList[0];
+  if (!keyBag?.key) throw new Error('Certificado inválido: chave privada não encontrada no PFX.');
+
+  const certBags    = p12.getBags({ bagType: forge.pki.oids.certBag });
+  const certBagList = certBags[forge.pki.oids.certBag] || [];
+  const certBag     = certBagList.find(b => b.cert) || certBagList[0];
+  if (!certBag?.cert) throw new Error('Certificado inválido: certificado público não encontrado no PFX.');
+
+  return {
+    keyPem:  forge.pki.privateKeyToPem(keyBag.key),
+    certPem: forge.pki.certificateToPem(certBag.cert),
+  };
+}
+
+// Cache em memória do PEM extraído — parse PKCS12 via forge é RSA em JS puro
+// (sem crypto nativa), então reparsear em toda consulta/cancelamento pesaria
+// no event loop. Invalida pelo mtime do arquivo, não por tempo.
+let certCache = null; // { mtimeMs, keyPem, certPem }
+
 function certLoader() {
   const file = path.join(DATA_DIR, 'techstore-cert.json');
   if (!fs.existsSync(file)) return null;
   try {
+    const mtimeMs = fs.statSync(file).mtimeMs;
+    if (certCache && certCache.mtimeMs === mtimeMs) {
+      return { keyPem: certCache.keyPem, certPem: certCache.certPem };
+    }
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!raw?.base64 || !raw?.senha) return null;
-    return {
-      pfxBuffer:  Buffer.from(raw.base64, 'base64'),
-      passphrase: raw.senha,
-    };
-  } catch {
+    const { keyPem, certPem } = extrairChaveECertPem(Buffer.from(raw.base64, 'base64'), raw.senha);
+    certCache = { mtimeMs, keyPem, certPem };
+    return { keyPem, certPem };
+  } catch (e) {
+    console.error('[NFSe Nacional] falha ao carregar certificado:', e.message);
     return null;
   }
 }
@@ -268,30 +306,10 @@ function montarDPS({ dados, configEmpresa, nDPS, tpAmb }) {
 
 // ── T5: assinarDPS ────────────────────────────────────────────────────────────
 
-async function assinarDPS(xmlStr, dpsId, pfxBuffer, passphrase) {
-  // Extrair chave privada e certificado do PFX via node-forge
-  const p12Asn1 = forge.asn1.fromDer(
-    forge.util.createBuffer(pfxBuffer.toString('binary'), 'binary')
-  );
-  const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, false, passphrase);
-
-  // Chave privada
-  const keyBags    = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
-  const keyBagList = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag] || [];
-  const keyBag     = keyBagList.find(b => b.key) || keyBagList[0];
-  if (!keyBag?.key) throw new Error('Certificado inválido: chave privada não encontrada no PFX.');
-  const privateKey = forge.pki.privateKeyToPem(keyBag.key);
-
-  // Certificado público
-  const certBags    = p12.getBags({ bagType: forge.pki.oids.certBag });
-  const certBagList = certBags[forge.pki.oids.certBag] || [];
-  const certBag     = certBagList.find(b => b.cert) || certBagList[0];
-  if (!certBag?.cert) throw new Error('Certificado inválido: certificado público não encontrado no PFX.');
-  const publicCert = forge.pki.certificateToPem(certBag.cert);
-
+async function assinarDPS(xmlStr, dpsId, keyPem, certPem) {
   const sig = new SignedXml({
-    privateKey,
-    publicCert,
+    privateKey:  keyPem,
+    publicCert:  certPem,
     signatureAlgorithm:       'http://www.w3.org/2000/09/xmldsig#rsa-sha1',
     canonicalizationAlgorithm: 'http://www.w3.org/TR/2001/REC-xml-c14n-20010315',
   });
@@ -329,7 +347,7 @@ function gzipBase64(xmlStr) {
   });
 }
 
-function mtlsRequest({ host, reqPath, method, bodyObj, pfxBuffer, passphrase }) {
+function mtlsRequest({ host, reqPath, method, bodyObj, certPem, keyPem }) {
   return new Promise((resolve, reject) => {
     const bodyStr    = bodyObj ? JSON.stringify(bodyObj) : '';
     const bodyBuffer = bodyStr ? Buffer.from(bodyStr, 'utf8') : null;
@@ -342,8 +360,8 @@ function mtlsRequest({ host, reqPath, method, bodyObj, pfxBuffer, passphrase }) 
         'Content-Type':  'application/json; charset=utf-8',
         'Accept':        'application/json',
       },
-      pfx:                 pfxBuffer,
-      passphrase:          passphrase,
+      cert:                certPem,
+      key:                 keyPem,
       rejectUnauthorized:  false, // ambientes gov.br usam certs que podem falhar validação padrão
       timeout:             30000,
     };
@@ -397,7 +415,7 @@ async function handleEmitir(req, res) {
       const { xml, dpsId: id } = montarDPS({ dados, configEmpresa, nDPS, tpAmb });
       dpsId = id;
       console.log(`[NFSe Nacional] DPS montado: ${dpsId}`);
-      xmlAssinado = await assinarDPS(xml, dpsId, cert.pfxBuffer, cert.passphrase);
+      xmlAssinado = await assinarDPS(xml, dpsId, cert.keyPem, cert.certPem);
       console.log(`[NFSe Nacional] DPS assinado com sucesso.`);
     } catch (err) {
       rollbackNDps();
@@ -411,8 +429,8 @@ async function handleEmitir(req, res) {
       reqPath:    SEFIN_PATH,
       method:     'POST',
       bodyObj:    { dpsXmlGZipB64 },
-      pfxBuffer:  cert.pfxBuffer,
-      passphrase: cert.passphrase,
+      certPem:    cert.certPem,
+      keyPem:     cert.keyPem,
     });
 
     console.log(`[NFSe Nacional] Resposta HTTP ${status}:`, JSON.stringify(body).slice(0, 400));
@@ -458,8 +476,8 @@ async function consultarSefin(chaveAcesso, ambiente) {
     host:       sefinHost,
     reqPath:    `${SEFIN_PATH}/${encodeURIComponent(chaveAcesso)}`,
     method:     'GET',
-    pfxBuffer:  cert.pfxBuffer,
-    passphrase: cert.passphrase,
+    certPem:    cert.certPem,
+    keyPem:     cert.keyPem,
   });
   return { status, body };
 }
@@ -532,8 +550,8 @@ async function handleCancelar(req, res) {
       reqPath,
       method:     'POST',
       bodyObj:    { tpEvento: '1', xJust: justificativa.trim() },
-      pfxBuffer:  cert.pfxBuffer,
-      passphrase: cert.passphrase,
+      certPem:    cert.certPem,
+      keyPem:     cert.keyPem,
     });
 
     console.log(`[NFSe Nacional cancelar] HTTP ${status}:`, JSON.stringify(body).slice(0, 200));

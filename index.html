@@ -4675,14 +4675,36 @@ function renderizarNfseEmitidas(lista) {
   }).join('');
 }
 
-function baixarXmlNfse(chaveAcesso, ambiente) {
+// window.open(url) direto não manda o header Authorization (token é Bearer,
+// não cookie — ver requireAuth() no emissor-server.cjs) — navegação de página
+// sempre batia em "Sessão inválida ou expirada", mesmo logado. Mesmo padrão
+// fetch+blob já usado em baixarArquivoNFe() acima pros downloads da Focus NFe.
+async function baixarXmlNfse(chaveAcesso, ambiente) {
   const url = `/nfse/xml?chaveAcesso=${encodeURIComponent(chaveAcesso)}&ambiente=${encodeURIComponent(ambiente)}`;
-  window.open(url, '_blank');
+  try {
+    const resp = await fetch(url, { headers: { 'Authorization': 'Bearer ' + _getToken() } });
+    if (!resp.ok) throw new Error(await resp.text());
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `NFSe_${chaveAcesso}.xml`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) {
+    alert('Erro ao baixar XML: ' + e.message);
+  }
 }
 
-function baixarPdfNfse(chaveAcesso, ambiente) {
+async function baixarPdfNfse(chaveAcesso, ambiente) {
   const url = `/nfse/pdf?chaveAcesso=${encodeURIComponent(chaveAcesso)}&ambiente=${encodeURIComponent(ambiente)}`;
-  window.open(url, '_blank');
+  try {
+    const resp = await fetch(url, { headers: { 'Authorization': 'Bearer ' + _getToken() } });
+    if (!resp.ok) throw new Error(await resp.text());
+    const blob = await resp.blob();
+    window.open(URL.createObjectURL(blob), '_blank');
+  } catch (e) {
+    alert('Erro ao abrir PDF: ' + e.message);
+  }
 }
 
 // Carregar NFS-e ao inicializar
